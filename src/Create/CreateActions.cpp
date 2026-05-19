@@ -115,10 +115,11 @@ void CreateActions::createDigitize (MainWindow &mw)
   connect (mw.m_actionDigitizeCurve, SIGNAL (triggered ()), &mw, SLOT (slotDigitizeCurve ()));
 
   mw.m_actionDigitizeAutoCurve = new QAction (tr ("Auto Curve"), &mw);
-  mw.m_actionDigitizeAutoCurve->setStatusTip (tr ("Automatically detect and create editable curve points."));
+  mw.m_actionDigitizeAutoCurve->setStatusTip (tr ("Automatically detect and create editable curve points. Hold Shift to teach one marker example."));
   mw.m_actionDigitizeAutoCurve->setWhatsThis (tr ("Auto Curve\n\n"
                                                   "Automatically detects visible data point markers inside the calibrated plot area "
-                                                  "and creates editable curve points on the currently selected curve."));
+                                                  "and creates editable curve points on the currently selected curve. Hold Shift while clicking "
+                                                  "Auto Curve, then click one example marker, to search for visually similar markers."));
   connect (mw.m_actionDigitizeAutoCurve, SIGNAL (triggered ()), &mw, SLOT (slotDigitizeAutoCurve ()));
 
   mw.m_actionDigitizePointMatch = new QAction (iconPointMatch, tr ("Point Match Tool"), &mw);

@@ -22,6 +22,9 @@ private slots:
   void testSingleCaseArtifactsRejected ();
   void testMarkerGroupsAreDistinctAndCentered ();
   void testSingleCaseOpenAndFilledCirclesDetected ();
+  void testSCDSquaresAndFilledCirclesDetected ();
+  void testSCDOpenAndFilledTrianglesDetected ();
+  void testTeachMarkerFindsSimilarMarkers ();
   void testAutoAxisStartsAtZero ();
 
 private:
@@ -32,6 +35,8 @@ private:
   Transformation regressionTransformation () const;
   QImage singleCaseCircleImage () const;
   Transformation singleCaseCircleTransformation () const;
+  QImage mixedShapeSCDImage () const;
+  QImage triangleSCDImage () const;
 };
 
 #endif // TEST_AUTO_DIGITIZE_H

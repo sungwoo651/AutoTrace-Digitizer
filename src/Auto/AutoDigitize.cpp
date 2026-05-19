@@ -27,7 +27,7 @@ const int CURVE_POINT_MIN_SPACING = 16;
 const int AUTO_CURVE_MAX_RAW_CANDIDATES = 250;
 const int MARKER_PATCH_SIZE = 32;
 const int MARKER_PATCH_FEATURE_SIZE = 16;
-const double MARKER_CLUSTER_DISTANCE_THRESHOLD = 0.08;
+const double MARKER_CLUSTER_DISTANCE_THRESHOLD = 0.10;
 
 struct Run
 {
@@ -73,6 +73,7 @@ struct MarkerCandidate
     area (0),
     size (0.0),
     score (0.0),
+    coreDensity (0.0),
     shapeKind (0)
   {
   }
@@ -82,6 +83,7 @@ struct MarkerCandidate
   int area;
   double size;
   double score;
+  double coreDensity;
   int shapeKind;
   QVector<unsigned char> patch;
   QVector<double> features;
@@ -778,6 +780,29 @@ QVector<unsigned char> extractNormalizedPatchAroundPoint(const QVector<unsigned 
   return patch;
 }
 
+double localCoreDensity(const QVector<unsigned char> &mask,
+                        int width,
+                        int height,
+                        const QPoint &center)
+{
+  int foreground = 0;
+  int pixels = 0;
+  const int radius = 3;
+  for (int y = qMax(0, center.y() - radius); y <= qMin(height - 1, center.y() + radius); ++y) {
+    for (int x = qMax(0, center.x() - radius); x <= qMin(width - 1, center.x() + radius); ++x) {
+      const int dx = x - center.x();
+      const int dy = y - center.y();
+      if (dx * dx + dy * dy > radius * radius) {
+        continue;
+      }
+      foreground += mask [indexFor(x, y, width)];
+      ++pixels;
+    }
+  }
+
+  return static_cast<double> (foreground) / qMax(1, pixels);
+}
+
 double patchForegroundRatio(const QVector<unsigned char> &patch)
 {
   int foreground = 0;
@@ -869,6 +894,42 @@ double patchCenterForegroundRatio(const QVector<unsigned char> &patch)
   return static_cast<double> (foreground) / qMax(1, pixels);
 }
 
+double patchCoreForegroundRatio(const QVector<unsigned char> &patch)
+{
+  int foreground = 0;
+  int pixels = 0;
+  const int minimum = MARKER_PATCH_SIZE / 2 - 2;
+  const int maximum = MARKER_PATCH_SIZE / 2 + 1;
+  for (int y = minimum; y <= maximum; ++y) {
+    for (int x = minimum; x <= maximum; ++x) {
+      foreground += patch [indexFor(x, y, MARKER_PATCH_SIZE)];
+      ++pixels;
+    }
+  }
+
+  return static_cast<double> (foreground) / qMax(1, pixels);
+}
+
+double patchCornerForegroundRatio(const QVector<unsigned char> &patch)
+{
+  int foreground = 0;
+  int pixels = 0;
+  const double center = (MARKER_PATCH_SIZE - 1) / 2.0;
+  for (int y = 0; y < MARKER_PATCH_SIZE; ++y) {
+    for (int x = 0; x < MARKER_PATCH_SIZE; ++x) {
+      const double dx = std::abs(x - center) / center;
+      const double dy = std::abs(y - center) / center;
+      if (dx < 0.24 || dy < 0.24 || dx * dx + dy * dy < 0.18) {
+        continue;
+      }
+      foreground += patch [indexFor(x, y, MARKER_PATCH_SIZE)];
+      ++pixels;
+    }
+  }
+
+  return static_cast<double> (foreground) / qMax(1, pixels);
+}
+
 double patchEdgeDensity(const QVector<unsigned char> &patch)
 {
   int transitions = 0;
@@ -896,6 +957,8 @@ QVector<double> markerFeatures(const MarkerCandidate &candidate)
   const double foregroundRatio = patchForegroundRatio(candidate.patch);
   const double holeRatio = patchHoleRatio(candidate.patch);
   const double edgeDensity = patchEdgeDensity(candidate.patch);
+  const double coreRatio = patchCoreForegroundRatio(candidate.patch);
+  const double cornerRatio = patchCornerForegroundRatio(candidate.patch);
   const double density = static_cast<double> (candidate.area) /
                          qMax(1, candidate.bounds.width() * candidate.bounds.height());
   const double aspect = static_cast<double> (qMin(candidate.bounds.width(), candidate.bounds.height())) /
@@ -943,6 +1006,9 @@ QVector<double> markerFeatures(const MarkerCandidate &candidate)
   features << foregroundRatio * 1.4
            << holeRatio * 2.2
            << edgeDensity
+           << coreRatio * 1.6
+           << candidate.coreDensity * 1.8
+           << cornerRatio * 2.0
            << density
            << aspect
            << (candidate.bounds.width() / qMax(1.0, candidate.size)) * 0.35
@@ -1049,6 +1115,10 @@ QVector<MarkerCandidate> markerCandidatesFromComponents(const QVector<unsigned c
                              QPoint(component.maxX, component.maxY));
     candidate.area = component.area;
     candidate.size = qMax(componentWidth, componentHeight);
+    candidate.coreDensity = localCoreDensity(mask,
+                                             width,
+                                             height,
+                                             center);
     candidate.patch = extractNormalizedPatch(mask,
                                              width,
                                              height,
@@ -1296,7 +1366,7 @@ QVector<MarkerCandidate> localMarkerCandidates(const QVector<unsigned char> &mas
         }
       }
 
-      if (bestScore < 0.72 || bestRadius <= 0) {
+      if (bestScore < 0.66 || bestRadius <= 0) {
         continue;
       }
 
@@ -1314,6 +1384,10 @@ QVector<MarkerCandidate> localMarkerCandidates(const QVector<unsigned char> &mas
       candidate.area = bestArea;
       candidate.size = qMax(bestBounds.width(), bestBounds.height());
       candidate.score = bestScore;
+      candidate.coreDensity = localCoreDensity(mask,
+                                               width,
+                                               height,
+                                               center);
       candidate.patch = extractNormalizedPatchAroundPoint(mask,
                                                           width,
                                                           height,
@@ -1341,6 +1415,8 @@ double circleTemplateScore(const QVector<unsigned char> &mask,
   int centerPixels = 0;
   int diskForeground = 0;
   int diskPixels = 0;
+  int cornerForeground = 0;
+  int cornerPixels = 0;
   area = 0;
 
   const double centerRadiusSquared = radius * radius * 0.18;
@@ -1362,6 +1438,11 @@ double circleTemplateScore(const QVector<unsigned char> &mask,
       if (distanceSquared <= diskRadiusSquared) {
         ++diskPixels;
       }
+      if (std::abs(dx) >= radius * 0.58 &&
+          std::abs(dy) >= radius * 0.58 &&
+          distanceSquared >= radiusSquared * 0.85) {
+        ++cornerPixels;
+      }
 
       if (!mask [indexFor(x, y, width)]) {
         continue;
@@ -1373,6 +1454,11 @@ double circleTemplateScore(const QVector<unsigned char> &mask,
       }
       if (distanceSquared <= diskRadiusSquared) {
         ++diskForeground;
+      }
+      if (std::abs(dx) >= radius * 0.58 &&
+          std::abs(dy) >= radius * 0.58 &&
+          distanceSquared >= radiusSquared * 0.85) {
+        ++cornerForeground;
       }
     }
   }
@@ -1403,6 +1489,7 @@ double circleTemplateScore(const QVector<unsigned char> &mask,
 
   const double centerRatio = static_cast<double> (centerForeground) / qMax(1, centerPixels);
   const double diskRatio = static_cast<double> (diskForeground) / qMax(1, diskPixels);
+  const double cornerRatio = static_cast<double> (cornerForeground) / qMax(1, cornerPixels);
   const double sectorRatio = static_cast<double> (activeSectors) / sectors.count();
   filledLike = diskRatio >= 0.30 && centerRatio >= 0.30 && activeSectors >= 8;
   const bool openLike = !filledLike &&
@@ -1475,17 +1562,37 @@ QVector<MarkerCandidate> circleTemplateCandidates(const QVector<unsigned char> &
       candidate.area = bestArea;
       candidate.size = bestRadius * 2 + 1;
       candidate.score = bestScore + (bestFilledLike ? 0.03 : 0.06);
+      candidate.coreDensity = localCoreDensity(mask,
+                                               width,
+                                               height,
+                                               center);
       candidate.patch = extractNormalizedPatchAroundPoint(mask,
                                                           width,
                                                           height,
                                                           QPointF(x, y),
                                                           qMax(16.0, candidate.size + 8.0));
       candidate.features = markerFeatures(candidate);
-      candidate.shapeKind = (bestFilledLike ||
-                             (patchCenterForegroundRatio(candidate.patch) >= 0.50 &&
-                              patchForegroundRatio(candidate.patch) >= 0.18) ||
-                             (patchForegroundRatio(candidate.patch) >= 0.32 &&
-                              patchHoleRatio(candidate.patch) < 0.020)) ? 2 : 1;
+      const double foregroundRatio = patchForegroundRatio(candidate.patch);
+      const double holeRatio = patchHoleRatio(candidate.patch);
+      const double centerRatio = patchCenterForegroundRatio(candidate.patch);
+      const double coreRatio = patchCoreForegroundRatio(candidate.patch);
+      const double cornerRatio = patchCornerForegroundRatio(candidate.patch);
+      const bool cornerHeavyFilled = bestFilledLike &&
+                                     cornerRatio >= 0.16 &&
+                                     holeRatio < 0.030;
+      if (!cornerHeavyFilled &&
+          (bestFilledLike ||
+           (coreRatio >= 0.65 &&
+            candidate.coreDensity >= 0.55 &&
+            foregroundRatio >= 0.16) ||
+           (centerRatio >= 0.50 &&
+            foregroundRatio >= 0.18) ||
+           (foregroundRatio >= 0.32 &&
+            holeRatio < 0.020))) {
+        candidate.shapeKind = 2;
+      } else if (!cornerHeavyFilled) {
+        candidate.shapeKind = 1;
+      }
       candidates << candidate;
     }
   }
@@ -2055,6 +2162,44 @@ bool pointsLookLikeVerticalArtifact(const QList<QPoint> &points)
   return xSpan <= qMax(5, ySpan / 12) && ySpan >= 24;
 }
 
+bool pointsHavePlausibleSessionSpread(const QList<QPoint> &points)
+{
+  if (points.count() <= 2) {
+    return true;
+  }
+
+  QList<int> sortedX;
+  for (int index = 0; index < points.count(); ++index) {
+    sortedX << points.at(index).x();
+  }
+  std::sort(sortedX.begin(), sortedX.end());
+
+  QList<int> binCounts;
+  for (int index = 0; index < sortedX.count(); ++index) {
+    if (binCounts.isEmpty() ||
+        std::abs(sortedX.at(index) - sortedX.at(index - 1)) > 6) {
+      binCounts << 1;
+    } else {
+      ++binCounts [binCounts.count() - 1];
+    }
+  }
+
+  int largestBin = 0;
+  for (int index = 0; index < binCounts.count(); ++index) {
+    largestBin = qMax(largestBin, binCounts.at(index));
+  }
+
+  if (binCounts.count() < qMin(2, points.count())) {
+    return false;
+  }
+
+  if (largestBin >= qMax(4, qRound(points.count() * 0.60))) {
+    return false;
+  }
+
+  return true;
+}
+
 QString inferredMarkerGroupName(const MarkerCluster &cluster,
                                 const QVector<MarkerCandidate> &candidates)
 {
@@ -2102,20 +2247,186 @@ QList<AutoCurveGroup> groupsFromCircleTemplateKinds(const QVector<MarkerCandidat
 {
   QList<AutoCurveGroup> groups;
   for (int shapeKind = 1; shapeKind <= 2; ++shapeKind) {
-    AutoCurveGroup group;
-    group.name = shapeKind == 1 ?
-                 QObject::tr("open circle-like markers") :
-                 QObject::tr("filled circle-like markers");
-    for (int index = 0; index < candidates.count(); ++index) {
-      if (candidates.at(index).shapeKind != shapeKind) {
+    QVector<MarkerCluster> clusters;
+    for (int candidateIndex = 0; candidateIndex < candidates.count(); ++candidateIndex) {
+      if (candidates.at(candidateIndex).shapeKind != shapeKind) {
         continue;
       }
-      addCurvePointIfSeparated(group.points,
-                               candidates.at(index).center);
+
+      int bestCluster = -1;
+      double bestDistance = std::numeric_limits<double>::max();
+      for (int clusterIndex = 0; clusterIndex < clusters.count(); ++clusterIndex) {
+        const double shapeDistance = featureDistance(candidates.at(candidateIndex).features,
+                                                     clusters [clusterIndex].centroid);
+        const MarkerCandidate &representative = candidates.at(clusters [clusterIndex].candidateIndexes.first());
+        const double sizeDistance = std::abs(candidates.at(candidateIndex).size - representative.size) /
+                                    qMax(1.0, qMax(candidates.at(candidateIndex).size, representative.size));
+        const double distance = shapeDistance + sizeDistance * 0.08;
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestCluster = clusterIndex;
+        }
+      }
+
+      const double kindDistanceThreshold = shapeKind == 1 ? 0.16 : 0.20;
+      if (bestCluster >= 0 && bestDistance <= kindDistanceThreshold) {
+        clusters [bestCluster].candidateIndexes << candidateIndex;
+        updateClusterCentroid(clusters [bestCluster], candidates);
+      } else {
+        MarkerCluster cluster;
+        cluster.candidateIndexes << candidateIndex;
+        cluster.centroid = candidates.at(candidateIndex).features;
+        cluster.meanDistance = 0.0;
+        cluster.sizeVariation = 0.0;
+        clusters << cluster;
+      }
     }
 
+    for (int clusterIndex = 0; clusterIndex < clusters.count(); ++clusterIndex) {
+      AutoCurveGroup group;
+      group.name = shapeKind == 1 ?
+                   QObject::tr("open circle-like markers") :
+                   QObject::tr("filled marker matches");
+      for (int index = 0; index < clusters.at(clusterIndex).candidateIndexes.count(); ++index) {
+        addCurvePointIfSeparated(group.points,
+                                 candidates.at(clusters.at(clusterIndex).candidateIndexes.at(index)).center);
+      }
+
+      if (!group.points.isEmpty()) {
+        group.confidence = 100.0 + group.points.count();
+        groups << group;
+      }
+    }
+  }
+
+  return groups;
+}
+
+QVector<double> filledCandidateDescriptor(const MarkerCandidate &candidate)
+{
+  const double foregroundRatio = patchForegroundRatio(candidate.patch);
+  const double holeRatio = patchHoleRatio(candidate.patch);
+  const double centerRatio = patchCenterForegroundRatio(candidate.patch);
+  const double coreRatio = patchCoreForegroundRatio(candidate.patch);
+  const double cornerRatio = patchCornerForegroundRatio(candidate.patch);
+  const double edgeDensity = patchEdgeDensity(candidate.patch);
+  const double aspect = static_cast<double> (qMin(candidate.bounds.width(), candidate.bounds.height())) /
+                        qMax(1, qMax(candidate.bounds.width(), candidate.bounds.height()));
+
+  QVector<double> descriptor;
+  descriptor << foregroundRatio
+             << centerRatio * 1.2
+             << coreRatio * 1.8
+             << candidate.coreDensity * 2.2
+             << holeRatio * 1.8
+             << cornerRatio * 2.2
+             << edgeDensity
+             << aspect
+             << candidate.size / 32.0;
+  return descriptor;
+}
+
+bool candidateLooksFilledForGrouping(const MarkerCandidate &candidate)
+{
+  const double foregroundRatio = patchForegroundRatio(candidate.patch);
+  const double holeRatio = patchHoleRatio(candidate.patch);
+
+  return foregroundRatio >= 0.20 &&
+         holeRatio <= 0.035;
+}
+
+double descriptorDistance(const QVector<double> &left,
+                          const QVector<double> &right)
+{
+  const int count = qMin(left.count(), right.count());
+  if (count == 0) {
+    return std::numeric_limits<double>::max();
+  }
+
+  double sum = 0.0;
+  for (int index = 0; index < count; ++index) {
+    const double delta = left.at(index) - right.at(index);
+    sum += delta * delta;
+  }
+  return std::sqrt(sum / count);
+}
+
+QList<AutoCurveGroup> groupsFromFilledSimilarity(const QVector<MarkerCandidate> &candidates)
+{
+  struct FilledCluster
+  {
+    QList<int> indexes;
+    QVector<double> centroid;
+  };
+
+  QVector<FilledCluster> clusters;
+  QList<int> filledCandidateIndexes;
+  for (int candidateIndex = 0; candidateIndex < candidates.count(); ++candidateIndex) {
+    if (!candidateLooksFilledForGrouping(candidates.at(candidateIndex))) {
+      continue;
+    }
+    filledCandidateIndexes << candidateIndex;
+
+    const QVector<double> descriptor = filledCandidateDescriptor(candidates.at(candidateIndex));
+    int bestCluster = -1;
+    double bestDistance = std::numeric_limits<double>::max();
+    for (int clusterIndex = 0; clusterIndex < clusters.count(); ++clusterIndex) {
+      const double distance = descriptorDistance(descriptor,
+                                                 clusters.at(clusterIndex).centroid);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestCluster = clusterIndex;
+      }
+    }
+
+    if (bestCluster >= 0 && bestDistance <= 0.08) {
+      clusters [bestCluster].indexes << candidateIndex;
+      QVector<double> centroid(clusters.at(bestCluster).centroid.count(), 0.0);
+      for (int index = 0; index < clusters.at(bestCluster).indexes.count(); ++index) {
+        const QVector<double> current = filledCandidateDescriptor(candidates.at(clusters.at(bestCluster).indexes.at(index)));
+        for (int featureIndex = 0; featureIndex < centroid.count(); ++featureIndex) {
+          centroid [featureIndex] += current.at(featureIndex);
+        }
+      }
+      for (int featureIndex = 0; featureIndex < centroid.count(); ++featureIndex) {
+        centroid [featureIndex] /= clusters.at(bestCluster).indexes.count();
+      }
+      clusters [bestCluster].centroid = centroid;
+    } else {
+      FilledCluster cluster;
+      cluster.indexes << candidateIndex;
+      cluster.centroid = descriptor;
+      clusters << cluster;
+    }
+  }
+
+  QList<AutoCurveGroup> groups;
+  bool hasRepeatedFilledCluster = false;
+  for (int clusterIndex = 0; clusterIndex < clusters.count(); ++clusterIndex) {
+    AutoCurveGroup group;
+    group.name = QObject::tr("filled marker matches");
+    for (int index = 0; index < clusters.at(clusterIndex).indexes.count(); ++index) {
+      addCurvePointIfSeparated(group.points,
+                               candidates.at(clusters.at(clusterIndex).indexes.at(index)).center);
+    }
     if (!group.points.isEmpty()) {
-      group.confidence = 100.0 + group.points.count();
+      group.confidence = 80.0 + group.points.count();
+      groups << group;
+      if (group.points.count() >= 4) {
+        hasRepeatedFilledCluster = true;
+      }
+    }
+  }
+
+  if (!hasRepeatedFilledCluster && filledCandidateIndexes.count() >= 4) {
+    AutoCurveGroup group;
+    group.name = QObject::tr("filled marker matches");
+    for (int index = 0; index < filledCandidateIndexes.count(); ++index) {
+      addCurvePointIfSeparated(group.points,
+                               candidates.at(filledCandidateIndexes.at(index)).center);
+    }
+    if (!group.points.isEmpty()) {
+      group.confidence = 70.0 + group.points.count();
       groups << group;
     }
   }
@@ -2166,6 +2477,10 @@ QList<AutoCurveGroup> groupsFromClusters(const QVector<MarkerCluster> &clusters,
   for (int index = 0; index < circleKindGroups.count(); ++index) {
     groups << circleKindGroups.at(index);
   }
+  const QList<AutoCurveGroup> filledSimilarityGroups = groupsFromFilledSimilarity(candidates);
+  for (int index = 0; index < filledSimilarityGroups.count(); ++index) {
+    groups << filledSimilarityGroups.at(index);
+  }
 
   for (int left = 0; left < groups.count(); ++left) {
     if (groups.at(left).name.isEmpty()) {
@@ -2188,6 +2503,23 @@ QList<AutoCurveGroup> groupsFromClusters(const QVector<MarkerCluster> &clusters,
         continue;
       }
 
+      if (!groups.at(left).name.contains(QObject::tr("open"), Qt::CaseInsensitive)) {
+        int overlap = 0;
+        for (int pointIndex = 0; pointIndex < groups.at(right).points.count(); ++pointIndex) {
+          for (int existingPointIndex = 0; existingPointIndex < groups.at(left).points.count(); ++existingPointIndex) {
+            const QPoint delta = groups.at(right).points.at(pointIndex) - groups.at(left).points.at(existingPointIndex);
+            if (delta.x() * delta.x() + delta.y() * delta.y() <= CURVE_POINT_MIN_SPACING * CURVE_POINT_MIN_SPACING) {
+              ++overlap;
+              break;
+            }
+          }
+        }
+        if (overlap < qMax(2, qMin(groups.at(left).points.count(), groups.at(right).points.count()) / 2)) {
+          ++right;
+          continue;
+        }
+      }
+
       for (int pointIndex = 0; pointIndex < groups.at(right).points.count(); ++pointIndex) {
         addCurvePointIfSeparated(groups [left].points,
                                  groups.at(right).points.at(pointIndex));
@@ -2205,6 +2537,9 @@ QList<AutoCurveGroup> groupsFromClusters(const QVector<MarkerCluster> &clusters,
       continue;
     }
     if (pointsLookLikeVerticalArtifact(groups.at(index).points)) {
+      continue;
+    }
+    if (!pointsHavePlausibleSessionSpread(groups.at(index).points)) {
       continue;
     }
 
@@ -2300,6 +2635,322 @@ void addCurvePointIfSeparated(QList<QPoint> &points,
   }
 
   points << point;
+}
+
+bool detectMarkerCandidatesForAutoCurve(const QImage &image,
+                                        const QRect &plotRect,
+                                        const Transformation &transformation,
+                                        double yMinimum,
+                                        double yMaximum,
+                                        AutoCurveResult &result,
+                                        QVector<MarkerCandidate> &candidates,
+                                        QVector<unsigned char> *foregroundMaskOut,
+                                        QVector<unsigned char> *lineSuppressedMaskOut,
+                                        QRect *boundsOut,
+                                        int *widthOut,
+                                        int *heightOut)
+{
+  result.rawCandidateCount = 0;
+  result.rejectedLineLikeCount = 0;
+  result.rejectedTextLikeCount = 0;
+  result.finalCandidateCount = 0;
+
+  if (image.isNull() || plotRect.isEmpty() || !transformation.transformIsDefined()) {
+    result.message = QObject::tr("No calibrated image area is available for Auto Curve.");
+    return false;
+  }
+
+  const QImage working = image.convertToFormat(QImage::Format_ARGB32);
+  const int width = working.width();
+  const int height = working.height();
+  const QRect imageRect(0, 0, width, height);
+  const int borderMargin = 0;
+  const QRect bounds = plotRect.adjusted(borderMargin,
+                                         borderMargin,
+                                         -borderMargin,
+                                         -borderMargin).intersected(imageRect);
+  if (bounds.isEmpty()) {
+    result.message = QObject::tr("No calibrated image area is available for Auto Curve.");
+    return false;
+  }
+
+  const QVector<unsigned char> mask = foregroundMask(working);
+  QVector<unsigned char> lineSuppressedMask = suppressLongRuns(mask,
+                                                               width,
+                                                               height,
+                                                               bounds);
+  lineSuppressedMask = suppressColumnAndRowArtifacts(lineSuppressedMask,
+                                                     width,
+                                                     height,
+                                                     bounds,
+                                                     &result.rejectedLineLikeCount);
+  const QVector<unsigned char> denseMask = denseForegroundMask(lineSuppressedMask,
+                                                              width,
+                                                              height,
+                                                              bounds);
+  candidates = markerCandidatesFromComponents(denseMask,
+                                              width,
+                                              height,
+                                              bounds,
+                                              transformation,
+                                              yMinimum,
+                                              yMaximum,
+                                              &result.rawCandidateCount,
+                                              &result.rejectedLineLikeCount);
+  if (result.rawCandidateCount > AUTO_CURVE_MAX_RAW_CANDIDATES) {
+    result.message = QObject::tr("Auto Curve found too many candidates. No points were added. Try a clearer graph or crop the plot area.");
+    return false;
+  }
+
+  const QVector<MarkerCandidate> circleCandidates = circleTemplateCandidates(lineSuppressedMask,
+                                                                             width,
+                                                                             height,
+                                                                             bounds,
+                                                                             transformation,
+                                                                             yMinimum,
+                                                                             yMaximum);
+  const QVector<MarkerCandidate> localCandidates = localMarkerCandidates(lineSuppressedMask,
+                                                                         width,
+                                                                         height,
+                                                                         bounds,
+                                                                         transformation,
+                                                                         yMinimum,
+                                                                         yMaximum);
+  for (int index = 0; index < circleCandidates.count(); ++index) {
+    candidates << circleCandidates.at(index);
+  }
+  for (int index = 0; index < localCandidates.count(); ++index) {
+    candidates << localCandidates.at(index);
+  }
+  candidates = deduplicatedMarkerCandidates(candidates);
+  result.rawCandidateCount += circleCandidates.count() + localCandidates.count();
+
+  if (result.rawCandidateCount > AUTO_CURVE_MAX_RAW_CANDIDATES) {
+    result.message = QObject::tr("Auto Curve found too many candidates. No points were added. Try a clearer graph or crop the plot area.");
+    return false;
+  }
+
+  candidates = rejectTextBoxCandidates(candidates,
+                                       mask,
+                                       width,
+                                       height,
+                                       bounds,
+                                       &result.rejectedTextLikeCount);
+  candidates = rejectVerticalCandidateClusters(candidates,
+                                               bounds,
+                                               &result.rejectedLineLikeCount);
+  candidates = rejectTextLikeCandidateClusters(candidates,
+                                               &result.rejectedTextLikeCount);
+  result.finalCandidateCount = candidates.count();
+
+  if (result.finalCandidateCount > AUTO_CURVE_MAX_RAW_CANDIDATES) {
+    result.groups.clear();
+    result.message = QObject::tr("Auto Curve found too many candidates. No points were added. Try a clearer graph or crop the plot area.");
+    return false;
+  }
+
+  if (foregroundMaskOut != nullptr) {
+    *foregroundMaskOut = mask;
+  }
+  if (lineSuppressedMaskOut != nullptr) {
+    *lineSuppressedMaskOut = lineSuppressedMask;
+  }
+  if (boundsOut != nullptr) {
+    *boundsOut = bounds;
+  }
+  if (widthOut != nullptr) {
+    *widthOut = width;
+  }
+  if (heightOut != nullptr) {
+    *heightOut = height;
+  }
+
+  return true;
+}
+
+MarkerCandidate markerCandidateFromExamplePoint(const QVector<unsigned char> &mask,
+                                                int width,
+                                                int height,
+                                                const QRect &bounds,
+                                                const Transformation &transformation,
+                                                double yMinimum,
+                                                double yMaximum,
+                                                const QPoint &examplePoint)
+{
+  MarkerCandidate candidate;
+  const int radius = 10;
+  const int left = qMax(bounds.left(), examplePoint.x() - radius);
+  const int right = qMin(bounds.right(), examplePoint.x() + radius);
+  const int top = qMax(bounds.top(), examplePoint.y() - radius);
+  const int bottom = qMin(bounds.bottom(), examplePoint.y() + radius);
+
+  int minX = std::numeric_limits<int>::max();
+  int maxX = std::numeric_limits<int>::min();
+  int minY = std::numeric_limits<int>::max();
+  int maxY = std::numeric_limits<int>::min();
+  for (int y = top; y <= bottom; ++y) {
+    for (int x = left; x <= right; ++x) {
+      const int dx = x - examplePoint.x();
+      const int dy = y - examplePoint.y();
+      if (dx * dx + dy * dy > radius * radius ||
+          !mask [indexFor(x, y, width)]) {
+        continue;
+      }
+      ++candidate.area;
+      minX = qMin(minX, x);
+      maxX = qMax(maxX, x);
+      minY = qMin(minY, y);
+      maxY = qMax(maxY, y);
+    }
+  }
+
+  if (candidate.area <= 0) {
+    minX = qMax(bounds.left(), examplePoint.x() - 8);
+    maxX = qMin(bounds.right(), examplePoint.x() + 8);
+    minY = qMax(bounds.top(), examplePoint.y() - 8);
+    maxY = qMin(bounds.bottom(), examplePoint.y() + 8);
+  }
+
+  candidate.center = clampPointToYRange(QPointF(examplePoint),
+                                        transformation,
+                                        yMinimum,
+                                        yMaximum);
+  candidate.bounds = QRect(QPoint(minX, minY),
+                           QPoint(maxX, maxY));
+  candidate.size = qMax(8, qMax(candidate.bounds.width(), candidate.bounds.height()));
+  candidate.score = 1.0;
+  candidate.coreDensity = localCoreDensity(mask,
+                                           width,
+                                           height,
+                                           candidate.center);
+  candidate.patch = extractNormalizedPatchAroundPoint(mask,
+                                                      width,
+                                                      height,
+                                                      QPointF(examplePoint),
+                                                      qMax(18.0, candidate.size + 8.0));
+  candidate.features = markerFeatures(candidate);
+
+  const double centerRatio = patchCenterForegroundRatio(candidate.patch);
+  const double foregroundRatio = patchForegroundRatio(candidate.patch);
+  const double holeRatio = patchHoleRatio(candidate.patch);
+  if (centerRatio >= 0.50 &&
+      foregroundRatio >= 0.18 &&
+      holeRatio < 0.030) {
+    candidate.shapeKind = 2;
+  } else if (foregroundRatio >= 0.05) {
+    candidate.shapeKind = 1;
+  }
+
+  return candidate;
+}
+
+double markerSimilarityToExample(const MarkerCandidate &candidate,
+                                 const MarkerCandidate &example)
+{
+  double distance = featureDistance(candidate.features,
+                                    example.features);
+  distance += std::abs(candidate.size - example.size) /
+              qMax(1.0, qMax(candidate.size, example.size)) * 0.06;
+  if (candidate.shapeKind > 0 &&
+      example.shapeKind > 0 &&
+      candidate.shapeKind != example.shapeKind) {
+    distance += 0.12;
+  }
+
+  return distance;
+}
+
+AutoCurveGroup markerGroupFromExample(const QVector<MarkerCandidate> &candidates,
+                                      const QVector<unsigned char> &lineSuppressedMask,
+                                      int width,
+                                      int height,
+                                      const QRect &bounds,
+                                      const Transformation &transformation,
+                                      double yMinimum,
+                                      double yMaximum,
+                                      const QPoint &examplePoint)
+{
+  MarkerCandidate example = markerCandidateFromExamplePoint(lineSuppressedMask,
+                                                            width,
+                                                            height,
+                                                            bounds,
+                                                            transformation,
+                                                            yMinimum,
+                                                            yMaximum,
+                                                            examplePoint);
+
+  int nearestIndex = -1;
+  int nearestDistanceSquared = std::numeric_limits<int>::max();
+  for (int index = 0; index < candidates.count(); ++index) {
+    const QPoint delta = candidates.at(index).center - examplePoint;
+    const int distanceSquared = delta.x() * delta.x() + delta.y() * delta.y();
+    if (distanceSquared < nearestDistanceSquared) {
+      nearestDistanceSquared = distanceSquared;
+      nearestIndex = index;
+    }
+  }
+
+  if (nearestIndex >= 0 && nearestDistanceSquared <= 24 * 24) {
+    example = candidates.at(nearestIndex);
+  }
+
+  double bestDistance = std::numeric_limits<double>::max();
+  QVector<double> distances;
+  for (int index = 0; index < candidates.count(); ++index) {
+    const double distance = markerSimilarityToExample(candidates.at(index),
+                                                      example);
+    distances << distance;
+    bestDistance = qMin(bestDistance, distance);
+  }
+
+  const double threshold = example.shapeKind == 2 ?
+                           0.40 :
+                           example.shapeKind == 1 ?
+                           0.20 :
+                           qMin(0.20,
+                                qMax(0.095,
+                                     bestDistance + 0.055));
+  AutoCurveGroup group;
+  group.name = example.shapeKind == 1 ? QObject::tr("taught open circle-like markers") :
+               example.shapeKind == 2 ? QObject::tr("taught filled marker matches") :
+               QObject::tr("taught marker matches");
+  const bool exampleHasFilledCore = example.coreDensity >= 0.55;
+  for (int index = 0; index < candidates.count(); ++index) {
+    if (exampleHasFilledCore &&
+        candidates.at(index).coreDensity < 0.55) {
+      continue;
+    }
+    if (example.shapeKind == 2 &&
+        patchHoleRatio(candidates.at(index).patch) > 0.035) {
+      continue;
+    }
+    if (example.shapeKind == 2 &&
+        patchForegroundRatio(candidates.at(index).patch) < 0.20) {
+      continue;
+    }
+    if (distances.at(index) > threshold) {
+      continue;
+    }
+    addCurvePointIfSeparated(group.points,
+                             candidates.at(index).center);
+  }
+
+  std::sort(group.points.begin(),
+            group.points.end(),
+            [] (const QPoint &left, const QPoint &right) {
+              if (left.x() == right.x()) {
+                return left.y() < right.y();
+              }
+              return left.x() < right.x();
+            });
+  group.confidence = group.points.count() / qMax(0.05, threshold);
+
+  if (pointsLookLikeVerticalArtifact(group.points) ||
+      !pointsHavePlausibleSessionSpread(group.points)) {
+    group.points.clear();
+  }
+
+  return group;
 }
 
 } // namespace
@@ -2409,97 +3060,19 @@ AutoCurveResult AutoDigitize::detectCurvePointGroups(const QImage &image,
                                                      double yMaximum)
 {
   AutoCurveResult result;
-  if (image.isNull() || plotRect.isEmpty() || !transformation.transformIsDefined()) {
-    result.message = QObject::tr("No calibrated image area is available for Auto Curve.");
-    return result;
-  }
-
-  const QImage working = image.convertToFormat(QImage::Format_ARGB32);
-  const int width = working.width();
-  const int height = working.height();
-  const QRect imageRect(0, 0, width, height);
-  const int borderMargin = 0;
-  const QRect bounds = plotRect.adjusted(borderMargin,
-                                         borderMargin,
-                                         -borderMargin,
-                                         -borderMargin).intersected(imageRect);
-  if (bounds.isEmpty()) {
-    result.message = QObject::tr("No calibrated image area is available for Auto Curve.");
-    return result;
-  }
-
-  const QVector<unsigned char> mask = foregroundMask(working);
-  QVector<unsigned char> lineSuppressedMask = suppressLongRuns(mask,
-                                                               width,
-                                                               height,
-                                                               bounds);
-  lineSuppressedMask = suppressColumnAndRowArtifacts(lineSuppressedMask,
-                                                     width,
-                                                     height,
-                                                     bounds,
-                                                     &result.rejectedLineLikeCount);
-  const QVector<unsigned char> denseMask = denseForegroundMask(lineSuppressedMask,
-                                                              width,
-                                                              height,
-                                                              bounds);
-  QVector<MarkerCandidate> candidates = markerCandidatesFromComponents(denseMask,
-                                                                       width,
-                                                                       height,
-                                                                       bounds,
-                                                                       transformation,
-                                                                       yMinimum,
-                                                                       yMaximum,
-                                                                       &result.rawCandidateCount,
-                                                                       &result.rejectedLineLikeCount);
-  if (result.rawCandidateCount > AUTO_CURVE_MAX_RAW_CANDIDATES) {
-    result.message = QObject::tr("Auto Curve found too many candidates. No points were added. Try a clearer graph or crop the plot area.");
-    return result;
-  }
-
-  const QVector<MarkerCandidate> circleCandidates = circleTemplateCandidates(lineSuppressedMask,
-                                                                             width,
-                                                                             height,
-                                                                             bounds,
-                                                                             transformation,
-                                                                             yMinimum,
-                                                                             yMaximum);
-  const QVector<MarkerCandidate> localCandidates = localMarkerCandidates(lineSuppressedMask,
-                                                                         width,
-                                                                         height,
-                                                                         bounds,
-                                                                         transformation,
-                                                                         yMinimum,
-                                                                         yMaximum);
-  for (int index = 0; index < circleCandidates.count(); ++index) {
-    candidates << circleCandidates.at(index);
-  }
-  for (int index = 0; index < localCandidates.count(); ++index) {
-    candidates << localCandidates.at(index);
-  }
-  candidates = deduplicatedMarkerCandidates(candidates);
-  result.rawCandidateCount += circleCandidates.count() + localCandidates.count();
-
-  if (result.rawCandidateCount > AUTO_CURVE_MAX_RAW_CANDIDATES) {
-    result.message = QObject::tr("Auto Curve found too many candidates. No points were added. Try a clearer graph or crop the plot area.");
-    return result;
-  }
-
-  candidates = rejectTextBoxCandidates(candidates,
-                                       mask,
-                                       width,
-                                       height,
-                                       bounds,
-                                       &result.rejectedTextLikeCount);
-  candidates = rejectVerticalCandidateClusters(candidates,
-                                               bounds,
-                                               &result.rejectedLineLikeCount);
-  candidates = rejectTextLikeCandidateClusters(candidates,
-                                               &result.rejectedTextLikeCount);
-  result.finalCandidateCount = candidates.count();
-
-  if (result.finalCandidateCount > AUTO_CURVE_MAX_RAW_CANDIDATES) {
-    result.groups.clear();
-    result.message = QObject::tr("Auto Curve found too many candidates. No points were added. Try a clearer graph or crop the plot area.");
+  QVector<MarkerCandidate> candidates;
+  if (!detectMarkerCandidatesForAutoCurve(image,
+                                          plotRect,
+                                          transformation,
+                                          yMinimum,
+                                          yMaximum,
+                                          result,
+                                          candidates,
+                                          nullptr,
+                                          nullptr,
+                                          nullptr,
+                                          nullptr,
+                                          nullptr)) {
     return result;
   }
 
@@ -2519,5 +3092,58 @@ AutoCurveResult AutoDigitize::detectCurvePointGroups(const QImage &image,
                      .arg(pointCount);
   }
 
+  return result;
+}
+
+AutoCurveResult AutoDigitize::detectCurvePointGroupFromExample(const QImage &image,
+                                                               const QRect &plotRect,
+                                                               const Transformation &transformation,
+                                                               double yMinimum,
+                                                               double yMaximum,
+                                                               const QPoint &examplePoint)
+{
+  AutoCurveResult result;
+  QVector<MarkerCandidate> candidates;
+  QVector<unsigned char> lineSuppressedMask;
+  QRect bounds;
+  int width = 0;
+  int height = 0;
+  if (!detectMarkerCandidatesForAutoCurve(image,
+                                          plotRect,
+                                          transformation,
+                                          yMinimum,
+                                          yMaximum,
+                                          result,
+                                          candidates,
+                                          nullptr,
+                                          &lineSuppressedMask,
+                                          &bounds,
+                                          &width,
+                                          &height)) {
+    return result;
+  }
+
+  if (!bounds.contains(examplePoint)) {
+    result.message = QObject::tr("Auto Curve Teach Marker needs an example point inside the calibrated plot area.");
+    return result;
+  }
+
+  const AutoCurveGroup group = markerGroupFromExample(candidates,
+                                                      lineSuppressedMask,
+                                                      width,
+                                                      height,
+                                                      bounds,
+                                                      transformation,
+                                                      yMinimum,
+                                                      yMaximum,
+                                                      examplePoint);
+  if (group.points.isEmpty()) {
+    result.message = QObject::tr("Auto Curve Teach Marker did not find matching data markers.");
+    return result;
+  }
+
+  result.groups << group;
+  result.message = QObject::tr("Auto Curve Teach Marker detected %1 matching points.")
+                   .arg(group.points.count());
   return result;
 }

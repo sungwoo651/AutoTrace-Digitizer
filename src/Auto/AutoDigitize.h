@@ -67,6 +67,13 @@ public:
                                                 double yMinimum,
                                                 double yMaximum);
 
+  static AutoCurveResult detectCurvePointGroupFromExample(const QImage &image,
+                                                          const QRect &plotRect,
+                                                          const Transformation &transformation,
+                                                          double yMinimum,
+                                                          double yMaximum,
+                                                          const QPoint &examplePoint);
+
 private:
   AutoDigitize();
 };

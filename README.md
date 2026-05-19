@@ -22,8 +22,9 @@ AutoTrace Digitizer adds Windows portable packaging and early automation tools f
 - Auto Axis button.
 - Auto Curve button.
 - Auto Axis detects the bottom x-axis, supports mild image tilt correction, creates editable axis points, sets x minimum to 0, sets y minimum to 0, and prompts for y maximum.
-- Auto Curve detects marker objects inside the calibrated plot area, rejects axes, gridlines, phase dividers, labels, and text boxes, then creates one editable curve point at each marker center on the selected curve.
+- Auto Curve parses single-case design graph structure, rejects axes, gridlines, phase dividers, labels, text boxes, arrows, brackets, slash breaks, and other annotation artifacts, then creates one editable curve point at each marker center on the selected curve.
 - Repeated Auto Curve clicks cycle through visually similar marker groups and replace only the previous auto-created points.
+- Shift + Auto Curve starts Teach Marker mode: click one example marker to search the calibrated plot area for visually similar markers.
 - Auto Axis and Auto Curve are available from the Digitize menu and drawing toolbar.
 - Portable settings support through `portable-settings.ini`, `ENGAUGE_PORTABLE=1`, and a local `settings` folder beside the executable.
 - Default locale is US English (`en_US`) unless the user selects another locale in Settings / Main Window.
@@ -52,5 +53,5 @@ or directly with:
 ## Current Limitations
 
 - Auto Axis does not read axis numbers automatically.
-- Auto Curve is experimental. It is designed to reject common single-case design artifacts, but it may still need correction on low-resolution images, dense gridlines, overlapping labels, unusual marker symbols, or connecting lines touching markers.
+- Auto Curve is experimental. It is designed for common single-case design graphs, but it may still need correction on low-resolution images, dense gridlines, overlapping labels, unusual marker symbols, crossing series, or connecting lines touching markers.
 - Manual review of digitized points is recommended before using exported data.

@@ -313,6 +313,7 @@ MainWindow::MainWindow(const QString &errorReportFile,
   m_isErrorReportRegressionTest (isRegressionTest),
   m_timerRegressionFileCmdScript(nullptr),
   m_guidelines (*this),  
+  m_autoCurveTeachModePending (false),
   m_fittingCurve (nullptr),
   m_isExportOnly (isExportOnly),
   m_isExtractImageOnly (isExtractImageOnly),
@@ -2489,6 +2490,12 @@ void MainWindow::slotDigitizeAutoCurve ()
     curveName = curveNames.first();
   }
 
+  if (QApplication::keyboardModifiers() & Qt::ShiftModifier) {
+    m_autoCurveTeachModePending = true;
+    showTemporaryMessage(tr("Auto Curve Teach Marker: click one example data marker."));
+    return;
+  }
+
   const QString cycleKey = autoCurveCycleKey(m_currentFileWithPathAndFileExtension,
                                              document.pixmap().cacheKey(),
                                              curveName,
@@ -2499,11 +2506,15 @@ void MainWindow::slotDigitizeAutoCurve ()
                                              yMaximum);
   if (cycleKey != m_autoCurveCycleState.key ||
       m_autoCurveCycleState.markerGroups.isEmpty()) {
+    const QStringList previousPointIdentifiers = m_autoCurveCycleState.previousCurveName == curveName ?
+                                                 m_autoCurveCycleState.previousPointIdentifiers :
+                                                 QStringList();
     m_autoCurveCycleState.key = cycleKey;
     m_autoCurveCycleState.markerGroups.clear();
     m_autoCurveCycleState.markerGroupNames.clear();
     m_autoCurveCycleState.nextGroupIndex = 0;
-    m_autoCurveCycleState.previousPointIdentifiers.clear();
+    m_autoCurveCycleState.previousPointIdentifiers = previousPointIdentifiers;
+    m_autoCurveCycleState.previousCurveName = previousPointIdentifiers.isEmpty() ? QString() : curveName;
 
     const AutoCurveResult result = AutoDigitize::detectCurvePointGroups(document.pixmap().toImage(),
                                                                         plotRect,
@@ -2560,6 +2571,7 @@ void MainWindow::slotDigitizeAutoCurve ()
   m_cmdMediator->push(cmd);
   m_cmdMediator->endMacro();
   m_autoCurveCycleState.previousPointIdentifiers = cmd->identifiersAdded();
+  m_autoCurveCycleState.previousCurveName = curveName;
   m_autoCurveCycleState.nextGroupIndex = (groupIndex + 1) %
                                         m_autoCurveCycleState.markerGroups.count();
 
@@ -2577,6 +2589,133 @@ void MainWindow::slotDigitizeAutoCurve ()
                          .arg(points.count())
                          .arg(groupName));
   }
+}
+
+void MainWindow::runAutoCurveTeachMarkerAt(const QPointF &posScreen)
+{
+  if (m_cmdMediator == nullptr || m_currentFile.isEmpty()) {
+    QMessageBox::warning(this,
+                         tr("Auto Curve"),
+                         tr("Import an image before using Auto Curve."));
+    return;
+  }
+
+  if (!m_transformation.transformIsDefined()) {
+    QMessageBox::warning(this,
+                         tr("Auto Curve"),
+                         tr("Calibrate the axes before using Auto Curve."));
+    return;
+  }
+
+  Document &document = m_cmdMediator->document();
+  QRect plotRect;
+  double xMinimum = 0.0;
+  double xMaximum = 0.0;
+  double yMinimum = 0.0;
+  double yMaximum = 0.0;
+
+  if (!graphBoundsFromAxisPoints(document,
+                                 m_transformation,
+                                 document.pixmap().size(),
+                                 plotRect,
+                                 xMinimum,
+                                 xMaximum,
+                                 yMinimum,
+                                 yMaximum)) {
+    QMessageBox::warning(this,
+                         tr("Auto Curve"),
+                         tr("Could not determine the calibrated plot area."));
+    return;
+  }
+
+  QString curveName = selectedGraphCurve();
+  if (curveName.isEmpty()) {
+    const QStringList curveNames = document.curvesGraphsNames();
+    if (curveNames.isEmpty()) {
+      QMessageBox::warning(this,
+                           tr("Auto Curve"),
+                           tr("No graph curve is available for new points."));
+      return;
+    }
+    curveName = curveNames.first();
+  }
+
+  const AutoCurveResult result = AutoDigitize::detectCurvePointGroupFromExample(document.pixmap().toImage(),
+                                                                                plotRect,
+                                                                                m_transformation,
+                                                                                yMinimum,
+                                                                                yMaximum,
+                                                                                QPoint(qRound(posScreen.x()),
+                                                                                       qRound(posScreen.y())));
+  if (result.groups.isEmpty()) {
+    QMessageBox::warning(this,
+                         tr("Auto Curve"),
+                         result.message);
+    return;
+  }
+
+  const QList<QPoint> points = result.groups.first().points;
+  if (points.isEmpty()) {
+    QMessageBox::warning(this,
+                         tr("Auto Curve"),
+                         tr("Auto Curve Teach Marker did not find matching data markers."));
+    return;
+  }
+
+  QList<double> ordinals;
+  const int firstOrdinal = document.nextOrdinalForCurve(curveName);
+  for (int index = 0; index < points.count(); ++index) {
+    ordinals << firstOrdinal + index;
+  }
+
+  const QStringList previousExisting = m_autoCurveCycleState.previousCurveName == curveName ?
+                                       existingPointIdentifiers(document,
+                                                                m_autoCurveCycleState.previousPointIdentifiers) :
+                                       QStringList();
+  m_autoCurveCycleState.previousPointIdentifiers.clear();
+  m_autoCurveCycleState.previousCurveName.clear();
+
+  m_cmdMediator->beginMacro(tr("Auto Curve Teach Marker"));
+  if (!previousExisting.isEmpty()) {
+    CmdDelete *deleteCmd = new CmdDelete(*this,
+                                         document,
+                                         previousExisting);
+    m_cmdMediator->push(deleteCmd);
+  }
+
+  CmdAddPointsGraph *cmd = new CmdAddPointsGraph(*this,
+                                                 document,
+                                                 curveName,
+                                                 points,
+                                                 ordinals);
+  m_cmdMediator->push(cmd);
+  m_cmdMediator->endMacro();
+
+  m_autoCurveCycleState.key = autoCurveCycleKey(m_currentFileWithPathAndFileExtension,
+                                                document.pixmap().cacheKey(),
+                                                curveName,
+                                                plotRect,
+                                                xMinimum,
+                                                xMaximum,
+                                                yMinimum,
+                                                yMaximum) + QStringLiteral(":teach");
+  m_autoCurveCycleState.markerGroups.clear();
+  m_autoCurveCycleState.markerGroups << points;
+  m_autoCurveCycleState.markerGroupNames.clear();
+  m_autoCurveCycleState.markerGroupNames << result.groups.first().name;
+  m_autoCurveCycleState.nextGroupIndex = 0;
+  m_autoCurveCycleState.previousPointIdentifiers = cmd->identifiersAdded();
+  m_autoCurveCycleState.previousCurveName = curveName;
+
+  m_actionDigitizeSelect->setChecked(true);
+  slotDigitizeSelect();
+
+  const QString groupName = result.groups.first().name.isEmpty() ?
+                            tr("taught marker matches") :
+                            result.groups.first().name;
+  showTemporaryMessage(tr("Auto Curve Teach Marker: added %1 points from %2.")
+                       .arg(points.count())
+                       .arg(groupName));
 }
 
 void MainWindow::slotDigitizeAxis ()
@@ -3228,6 +3367,10 @@ void MainWindow::slotMousePress (QPointF pos)
 {
   LOG4CPP_INFO_S ((*mainCat)) << "MainWindow::slotMousePress";
 
+  if (m_autoCurveTeachModePending) {
+    return;
+  }
+
   m_scene->resetPositionHasChangedFlags();
 
   m_digitizeStateContext->handleMousePress (m_cmdMediator,
@@ -3237,6 +3380,18 @@ void MainWindow::slotMousePress (QPointF pos)
 void MainWindow::slotMouseRelease (QPointF pos)
 {
   LOG4CPP_INFO_S ((*mainCat)) << "MainWindow::slotMouseRelease";
+
+  if (m_autoCurveTeachModePending) {
+    m_autoCurveTeachModePending = false;
+    if (pos.x() < 0 || pos.y() < 0) {
+      showTemporaryMessage(tr("Auto Curve Teach Marker canceled."));
+      updateControls ();
+      return;
+    }
+
+    runAutoCurveTeachMarkerAt(pos);
+    return;
+  }
 
   if (pos.x() < 0 || pos.y() < 0) {
 

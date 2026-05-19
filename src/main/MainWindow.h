@@ -430,6 +430,7 @@ private:
     QStringList markerGroupNames;
     int nextGroupIndex;
     QStringList previousPointIdentifiers;
+    QString previousCurveName;
   };
 
   MainWindow();
@@ -496,6 +497,7 @@ private:
   QString messageCannotReadFile (const QString &fileName) const;
   bool modeGraph () const; // True if document is loaded and it has all graphs
   void rebuildRecentFileListForCurrentFile(const QString &filePath);
+  void runAutoCurveTeachMarkerAt (const QPointF &posScreen);
   bool saveDocumentFile(const QString &fileName);
   QString saveErrorReportFileAndExitXml (const char *comment,
                                          const char *file,
@@ -760,6 +762,7 @@ private:
   Guidelines m_guidelines;
 
   AutoCurveCycleState m_autoCurveCycleState;
+  bool m_autoCurveTeachModePending;
   
   // Map to/from/between zoom enumerations. These eliminate the need for switch statements
   QMap<ZoomFactorInitial, ZoomFactor> m_zoomMapFromInitial;
